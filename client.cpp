@@ -16,10 +16,11 @@ int main() {
     // 2.addr and port
     sockaddr_in server_addr{};
     server_addr.sin_family=AF_INET;
-    server_addr.sin_port=htons(8080);
+    server_addr.sin_port=htons(8088);
 
     if (inet_pton(AF_INET,"127.0.0.1",&server_addr.sin_addr)<=0) {
         std::cerr<<"address error"<<"\n";
+        close(client_fd);
         return -1;
     }
 
@@ -31,15 +32,28 @@ int main() {
     }
 
     // 4. send
-    const char* msg="hello world";
-    send(client_fd,msg,strlen(msg),0);
-    std::cout<<"sent"<<"\n";
+    std::string input;
+    char buffer[1024];
+    while (true) {
+        std::cout<<"输入："<<"\n";
+        std::getline(std::cin,input);
+        if (input=="exit")
+            break;
+        if (input.empty())
+            continue;
+        send(client_fd,input.c_str(),input.length(),0);
 
-    // 5.receive
-    char buffer[1024]={0};
-    ssize_t bytes_read=read(client_fd,buffer,sizeof(buffer)-1);
-    if (bytes_read>0)
-        std::cout<<buffer<<"\n";
+        memset(buffer,0,sizeof(buffer));
+        ssize_t bytes_read=read(client_fd,buffer,sizeof(buffer)-1);
+        if (bytes_read>0)
+            std::cout<<buffer<<"\n";
+        else {
+            std::cout<<"断开连接"<<"\n";
+            break;
+        }
+
+    }
+
 
     // 6.close
     close(client_fd);
