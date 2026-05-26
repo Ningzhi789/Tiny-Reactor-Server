@@ -4,10 +4,25 @@
 #include <netinet/in.h>     //包含socketaddr_in结构体
 #include <unistd.h>         //包含close函数
 #include <thread>           //多线程核心头文件
+#include <chrono>           //用于时间延迟
 #include <sys/epoll.h>      //epoll核心头文件
+#include "ThreadPool.hpp"   //引入手写线程池
 
 const int MAX_EVENTS=1024;
 const int BUFFER_SIZE=1024;
+
+// 模拟耗时的业务处理函数（运行在线程池中）
+void process_business(int client_fd,std::string request_msg) {
+    // 1. 模拟复杂的耗时业务（比如查数据库、复杂的逻辑运算等延迟）
+    // 即使这里睡眠 2 秒，也完全不会影响主线程 epoll 接收其他人的请求！
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    std::cout << "【工作线程 " << std::this_thread::get_id()
+              << "】业务处理完毕，正在回传 fd " << client_fd << std::endl;
+    // 2. 组装响应数据并发送给客户端
+    std::string response ="【V4高级架构回执】: " + request_msg;
+    send(client_fd,response.c_str(),response.length(),0);
+}
 
 int main() {
     // 1.socket
@@ -20,7 +35,6 @@ int main() {
     //设置端口复用
     int opt=1;
     setsockopt(server_fd,SOL_SOCKET,SO_REUSEADDR,&opt,sizeof(opt));
-
 
     // 2.addr and port
     sockaddr_in server_addr{};
@@ -41,7 +55,7 @@ int main() {
         close(server_fd);
         return -1;
     }
-    std::cout<<"listening"<<"\n";
+    std::cout<<"listening 8088"<<"\n";
 
     // 创建epoll实例
     // epoll_create1(0) 是现代 Linux 推荐写法
@@ -65,13 +79,14 @@ int main() {
         return -1;
     }
 
+    // 🔥 初始化一个拥有 4 个核心工作线程的线程池
+    ThreadPool pool(4);
     // 用于存放被唤醒的就绪事件数组
     epoll_event events[MAX_EVENTS];
 
     // 进入单线程事件大循环
     while (true) {
-        // 阻塞等待事件发生。-1 代表没有事件发生就死等
-        // 当有客户端发消息或有新连接时，此函数会被唤醒，返回发生事件的个数
+        // 主线程牢牢守护在这里，只负责监听 I/O 事件
         int nfds=epoll_wait(epoll_fd,events,MAX_EVENTS,-1);
         if (nfds == -1) {
             std::cerr << "epoll_wait 错误！" << std::endl;
@@ -98,6 +113,7 @@ int main() {
                 client_ev.events=EPOLLIN;       // 依然监听它发消息
                 client_ev.data.fd=client_fd;
                 epoll_ctl(epoll_fd,EPOLL_CTL_ADD,client_fd,&client_ev);
+                std::cout << "【主线程】捕获新连接，已托管至 epoll，fd: " << client_fd << std::endl;
             }
             // 情况 B：如果是普通的 client_fd 有动静，说明【有客户端发消息过来了】
             else if (events[i].events & EPOLLIN){
@@ -105,10 +121,13 @@ int main() {
                 ssize_t bytes_read=read(current_fd,buffer,sizeof(buffer)-1);
 
                 if (bytes_read > 0) {
-                    std::cout << "【收到消息 fd " << current_fd << "】: " << buffer << std::endl;
+                    std::cout << "【主线程】快速读取 fd " << current_fd << " 数据完毕，打包任务抛给线程池！" << std::endl;
 
-                    std::string response = "【Epoll回执】: " + std::string(buffer);
-                    send(current_fd, response.c_str(), response.length(), 0);
+                    // 🔥 核心架构升级：将业务逻辑处理封装为 lambda 表达式，打包投递给线程池
+                    std::string req_str(buffer);
+                    pool.enqueue([current_fd, req_str]() {
+                        process_business(current_fd, req_str);
+                    });
                 }
                 // bytes_read == 0 代表客户端主动断开连接
                 else if (bytes_read == 0) {

@@ -1,8 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
-project(c__)
+project(Tiny-Reactor-Server)
 
 set(CMAKE_CXX_STANDARD 20)
 
-add_executable(c__ main.cpp
+add_executable(Tiny-Reactor-Server main.cpp
         server.cpp
-        client.cpp)
+        client.cpp
+        ThreadPool.hpp)
