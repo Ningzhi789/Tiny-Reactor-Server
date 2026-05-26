@@ -4,35 +4,10 @@
 #include <netinet/in.h>     //包含socketaddr_in结构体
 #include <unistd.h>         //包含close函数
 #include <thread>           //多线程核心头文件
+#include <sys/epoll.h>      //epoll核心头文件
 
-void handle_client(int client_fd) {
-    std::cout << "【子线程 " << std::this_thread::get_id() << "】接管连接 fd: " << client_fd << std::endl;
-
-    char buffer[1024];
-
-    //循环让客户端持续聊天，直到主动断开
-    while (true) {
-        memset(buffer,0,sizeof(buffer));        //清空缓冲区
-
-        //阻塞读取客户端数据
-        ssize_t bytes_read=read(client_fd,buffer,sizeof(buffer)-1);
-        if (bytes_read>0) {
-            std::cout<<"receive message from "<<client_fd<<" "<<buffer<<"\n";
-            std::string response="received: " + std::string(buffer);
-            send(client_fd,response.c_str(),response.length(),0);
-        }
-        else if (bytes_read==0) {
-            std::cout<<client_fd<<"断开连接"<<"\n";
-            break;
-        }
-        else {
-            std::cerr<<client_fd<<"发生错误"<<"\n";
-            break;
-        }
-    }
-    close(client_fd);
-    std::cout<<"finish"<<"\n";
-}
+const int MAX_EVENTS=1024;
+const int BUFFER_SIZE=1024;
 
 int main() {
     // 1.socket
@@ -68,30 +43,93 @@ int main() {
     }
     std::cout<<"listening"<<"\n";
 
+    // 创建epoll实例
+    // epoll_create1(0) 是现代 Linux 推荐写法
+    int epoll_fd=epoll_create1(0);
+    if (epoll_fd==-1) {
+        std::cerr << "创建 epoll 实例失败！" << std::endl;
+        close(server_fd);
+        return -1;
+    }
+
+    //把服务器的监听套接字加入到 epoll 实例中
+    epoll_event ev{};
+    ev.events=EPOLLIN;      // 监听读事件（当有新客户端来连接时，server_fd 会触发读事件）
+    ev.data.fd=server_fd;   // 把关联的 fd 存进去
+
+    // EPOLL_CTL_ADD 代表将该 fd 添加到 epoll 监听树中
+    if (epoll_ctl(epoll_fd,EPOLL_CTL_ADD,server_fd,&ev)==-1) {
+        std::cerr << "将监听 fd 添加到 epoll 失败！" << std::endl;
+        close(server_fd);
+        close(epoll_fd);
+        return -1;
+    }
+
+    // 用于存放被唤醒的就绪事件数组
+    epoll_event events[MAX_EVENTS];
+
+    // 进入单线程事件大循环
     while (true) {
-        // 5.accept
-        sockaddr_in client_addr{};
-        socklen_t client_addr_len=sizeof(client_addr);
-        int client_fd=accept(server_fd,(struct sockaddr*)&client_addr,&client_addr_len);
-        if (client_fd<0) {
-            std::cerr<<"accept failed"<<"\n";
-            continue;
+        // 阻塞等待事件发生。-1 代表没有事件发生就死等
+        // 当有客户端发消息或有新连接时，此函数会被唤醒，返回发生事件的个数
+        int nfds=epoll_wait(epoll_fd,events,MAX_EVENTS,-1);
+        if (nfds == -1) {
+            std::cerr << "epoll_wait 错误！" << std::endl;
+            break;
         }
-        std::cout<<"connect "<<client_fd<<"\n";
 
-        // 核心：为当前客户端创建子线程
-        // 将 handle_client 函数和参数 client_fd 传给 std::thread
-        std::thread t(handle_client, client_fd);
+        // 依次处理 epoll_wait 返回的就绪事件
+        for (int i=0;i<nfds;i++) {
+            int current_fd=events[i].data.fd;
 
-        // 为什么要用 detach() 而不是 join()？
-        // join() 会让主线程卡住，等待子线程运行结束才继续，这就退化回单线程了。
-        // detach() 是将子线程与主线程“分离”，子线程在后台独立运行，生命周期由系统接管，
-        // 这样主线程就能立刻回到循环开头，去 accept 下一个连接。
-        t.detach();
+            // 情况 A：如果是 server_fd 有动静，说明是【新客户端要求连接】
+            if (current_fd==server_fd) {
+                sockaddr_in client_addr{};
+                socklen_t client_len=sizeof(client_addr);
+                int client_fd=accept(server_fd,(struct sockaddr*)&client_addr,&client_len);
+                if (client_fd < 0) {
+                    std::cerr << "接受新连接失败！" << std::endl;
+                    continue;
+                }
+                std::cout << "成功接受客户端连接，分配 fd: " << client_fd << std::endl;
+
+                // 把这个新客户端的 client_fd 也注册到 epoll 监听名单里
+                epoll_event client_ev{};
+                client_ev.events=EPOLLIN;       // 依然监听它发消息
+                client_ev.data.fd=client_fd;
+                epoll_ctl(epoll_fd,EPOLL_CTL_ADD,client_fd,&client_ev);
+            }
+            // 情况 B：如果是普通的 client_fd 有动静，说明【有客户端发消息过来了】
+            else if (events[i].events & EPOLLIN){
+                char buffer[BUFFER_SIZE]={0};
+                ssize_t bytes_read=read(current_fd,buffer,sizeof(buffer)-1);
+
+                if (bytes_read > 0) {
+                    std::cout << "【收到消息 fd " << current_fd << "】: " << buffer << std::endl;
+
+                    std::string response = "【Epoll回执】: " + std::string(buffer);
+                    send(current_fd, response.c_str(), response.length(), 0);
+                }
+                // bytes_read == 0 代表客户端主动断开连接
+                else if (bytes_read == 0) {
+                    std::cout << "【客户端离线】fd " << current_fd << " 主动断开连接。" << std::endl;
+                    // 从 epoll 监听树中移除（高版本 Linux 传 NULL 即可）
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_fd, nullptr);
+                    close(current_fd); // 必须关闭 fd 释放系统资源
+                }
+                // 发生错误
+                else {
+                    std::cerr << "读取 fd " << current_fd << " 发生异常错误。" << std::endl;
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_fd, nullptr);
+                    close(current_fd);
+                }
+            }
+        }
     }
 
     // 8.close
     close(server_fd);
+    close(epoll_fd);
     std::cout<<"close"<<"\n";
     return 0;
 }
