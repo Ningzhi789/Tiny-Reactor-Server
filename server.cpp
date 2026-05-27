@@ -9,11 +9,14 @@
 #include "ThreadPool.hpp"   //引入手写线程池
 #include <fcntl.h>          //非阻塞
 #include <cerrno>           //捕获errno错误码
+#include <unordered_map>    //新增：用于全局管理连接生命周期
+#include <memory>           //新增：智能指针核心头文件
+#include "Connection.hpp"   //新增：引入连接封装类
 
 const int MAX_EVENTS=1024;
 const int BUFFER_SIZE=1024;
 
-// 🔥 新增工具函数：将指定的文件描述符(fd)设置为非阻塞模式
+// 🔥 v5新增工具函数：将指定的文件描述符(fd)设置为非阻塞模式
 void set_nonblocking(int fd) {
     //获取老标志
     int flags=fcntl(fd,F_GETFL,0);
@@ -25,17 +28,17 @@ void set_nonblocking(int fd) {
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-// 模拟耗时的业务处理函数（运行在线程池中）
-void process_business(int client_fd,std::string request_msg) {
-    // 1. 模拟复杂的耗时业务（比如查数据库、复杂的逻辑运算等延迟）
-    // 即使这里睡眠 2 秒，也完全不会影响主线程 epoll 接收其他人的请求！
+// 🔥 v6修改：业务处理函数不再传裸 fd，而是传入持有的智能指针
+void process_business(std::shared_ptr<Connection> conn,std::string request_msg) {
+    // 模拟复杂的耗时业务
     std::this_thread::sleep_for(std::chrono::seconds(2));
-    std::cout<<"收到消息："<<request_msg<<"\n";
+
     std::cout << "【工作线程 " << std::this_thread::get_id()
-              << "】业务处理完毕，正在回传 fd " << client_fd << std::endl;
-    // 2. 组装响应数据并发送给客户端
-    std::string response ="已收到消息: " + request_msg;
-    send(client_fd,response.c_str(),response.length(),0);
+              << "】业务处理完毕，正在回传 fd " << conn.use_count() << std::endl;
+
+    // 直接通过智能指针内部安全的 fd 发送数据
+    std::string response ="【v6(v4+ET+智能指针)回执：】" + request_msg;
+    send(conn->fd,response.c_str(),response.length(),0);
 }
 
 int main() {
@@ -81,7 +84,7 @@ int main() {
     }
     //把服务器的监听套接字加入到 epoll 实例中
     epoll_event ev{};
-    // 🔥 注意：监听套接字 server_fd 建议保持默认的水平触发(LT)，确保新连接不漏掉
+    // 🔥 v5 注意：监听套接字 server_fd 建议保持默认的水平触发(LT)，确保新连接不漏掉
     ev.events=EPOLLIN;      // 监听读事件（当有新客户端来连接时，server_fd 会触发读事件）
     ev.data.fd=server_fd;   // 把关联的 fd 存进去
 
@@ -93,10 +96,13 @@ int main() {
         return -1;
     }
 
-    // 🔥 初始化一个拥有 4 个核心工作线程的线程池
+    // 初始化一个拥有 4 个核心工作线程的线程池
     ThreadPool pool(4);
     // 用于存放被唤醒的就绪事件数组
     epoll_event events[MAX_EVENTS];
+
+    // 🔥 v6核心修改：使用哈希表集中管理所有在线连接的智能指针
+    std::unordered_map<int,std::shared_ptr<Connection>> conn_map;
 
     // 进入单线程事件大循环
     while (true) {
@@ -122,11 +128,17 @@ int main() {
                 }
                 std::cout << "成功接受客户端连接，分配 fd: " << client_fd << std::endl;
 
-                // 🔥 关键修改 1：接受连接后，必须立刻将该客户端 fd 设为非阻塞
+                // 接受连接后，必须立刻将该客户端 fd 设为非阻塞
                 set_nonblocking(client_fd);
+
+                // 🔥 v6关键动作 1：为新连接创建 shared_ptr，并强行托管到全局 Map 中
+                // 此时全局 Map 持有它，引用计数为 1
+                auto conn = std::make_shared<Connection>(client_fd);
+                conn_map[client_fd]=conn;
+
                 // 把这个新客户端的 client_fd 也注册到 epoll 监听名单里
                 epoll_event client_ev{};
-                // 🔥 关键修改 2：注册事件时，显式加上 EPOLLET (边缘触发)
+                // 注册事件时，显式加上 EPOLLET (边缘触发)
                 client_ev.events=EPOLLIN | EPOLLET;       // 依然监听它发消息
                 client_ev.data.fd=client_fd;
                 epoll_ctl(epoll_fd,EPOLL_CTL_ADD,client_fd,&client_ev);
@@ -134,10 +146,15 @@ int main() {
             }
             // 情况 B：如果是普通的 client_fd 有动静，说明【有客户端发消息过来了】
             else if (events[i].events & EPOLLIN) {
+                // 先从 Map 里安全地取出这个连接的智能指针
+                if (conn_map.find(current_fd)==conn_map.end())
+                    continue;
+                auto conn=conn_map[current_fd];
+
                 char buffer[BUFFER_SIZE]={0};
                 std::string total_req_str="";   //拼接数据
                 bool is_closed=false;           //标记客户端是否断开
-                // 🔥 关键修改 3：因为是 ET 模式，必须用 while(true) 循环读取，直到读空
+                // 🔥 v5关键修改 3：因为是 ET 模式，必须用 while(true) 循环读取，直到读空
                 while (true) {
                     memset(buffer,0,sizeof(buffer));
                     ssize_t bytes_read=read(current_fd,buffer,sizeof(buffer)-1);
@@ -165,15 +182,18 @@ int main() {
 
                 //退出循环后继续处理后续
                 if (is_closed) {
+                    // 🔥 v6关键动作 2：客户端断开时，只从 epoll 树中摘除，并从全局 Map 中无情抹去！
+                    // 注意：此时主线程绝对不手工调用 close(current_fd)！
                     epoll_ctl(epoll_fd,EPOLL_CTL_DEL,current_fd,nullptr);
-                    close(current_fd);
+                    conn_map.erase(current_fd);
+                    std::cout << "【主线程】已将 fd " << current_fd << " 从全局 Map 中解绑。" << std::endl;
                 }
                 else if (!total_req_str.empty()) {
-                    // 只有当真正读到了数据，才打包投递给线程池
-                    std::cout << "【主线程】ET循环读取 fd " << current_fd << " 完毕，大小: "
-                              << total_req_str.length() << " 字节。抛交线程池！" << std::endl;
-                    pool.enqueue([current_fd,total_req_str]() {
-                       process_business(current_fd,total_req_str);
+                    // 🔥 v6关键动作 3：通过 Lambda 表达式“按值捕获” conn 指针抛给线程池
+                    // 按值复制会导致引用计数增加（此时至少为 2：Map 里有一个，Lambda 闭包里持有一个）
+
+                    pool.enqueue([conn,total_req_str]() {
+                       process_business(conn,total_req_str);
                     });
                 }
             }
