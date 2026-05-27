@@ -30,11 +30,11 @@ void process_business(int client_fd,std::string request_msg) {
     // 1. 模拟复杂的耗时业务（比如查数据库、复杂的逻辑运算等延迟）
     // 即使这里睡眠 2 秒，也完全不会影响主线程 epoll 接收其他人的请求！
     std::this_thread::sleep_for(std::chrono::seconds(2));
-
+    std::cout<<"收到消息："<<request_msg<<"\n";
     std::cout << "【工作线程 " << std::this_thread::get_id()
               << "】业务处理完毕，正在回传 fd " << client_fd << std::endl;
     // 2. 组装响应数据并发送给客户端
-    std::string response ="【V4高级架构回执】: " + request_msg;
+    std::string response ="已收到消息: " + request_msg;
     send(client_fd,response.c_str(),response.length(),0);
 }
 
