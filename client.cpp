@@ -4,6 +4,8 @@
 #include <arpa/inet.h>      //包含inet_pton()函数
 #include <netinet/in.h>
 #include <unistd.h>
+#include <vector>
+
 
 int main() {
     //  1.socket
@@ -30,6 +32,7 @@ int main() {
         close(client_fd);
         return -1;
     }
+    std::cout<<"连接成功"<<"\n";
 
     // 4. send
     std::string input;
@@ -41,7 +44,19 @@ int main() {
             break;
         if (input.empty())
             continue;
-        send(client_fd,input.c_str(),input.length(),0);
+
+        // 🔥 【V7 核心修改点】：打包流式协议报文（4字节 Header + Body）
+        uint32_t body_len=input.length();      // 1. 获取业务身体数据的绝对长度
+        uint32_t net_len=htonl(body_len);      // 2. 将本地字节序的整数转换为标准网络字节序（大端）
+
+        // 3. 申请一个连续的动态缓冲区，大小刚好等于：4 字节头部 + 身体长度
+        std::vector<char> send_buf(4+body_len);
+
+        // 4. 精准拷贝：前 4 字节塞进长度标签，后面紧跟真正的文本内容
+        std::memcpy(send_buf.data(),&net_len,4);
+        std::memcpy(send_buf.data()+4,input.c_str(),body_len);
+        // 5. 将这块打包好的完整内存一次性安全发送出去
+        send(client_fd,send_buf.data(),send_buf.size(),0);
 
         memset(buffer,0,sizeof(buffer));
         ssize_t bytes_read=read(client_fd,buffer,sizeof(buffer)-1);

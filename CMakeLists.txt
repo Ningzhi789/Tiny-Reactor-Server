@@ -7,4 +7,5 @@ add_executable(Tiny-Reactor-Server main.cpp
         server.cpp
         client.cpp
         ThreadPool.hpp
-        Connection.hpp)
+        Connection.hpp
+        Buffer.hpp)
