@@ -7,9 +7,23 @@
 #include <chrono>           //用于时间延迟
 #include <sys/epoll.h>      //epoll核心头文件
 #include "ThreadPool.hpp"   //引入手写线程池
+#include <fcntl.h>          //非阻塞
+#include <cerrno>           //捕获errno错误码
 
 const int MAX_EVENTS=1024;
 const int BUFFER_SIZE=1024;
+
+// 🔥 新增工具函数：将指定的文件描述符(fd)设置为非阻塞模式
+void set_nonblocking(int fd) {
+    //获取老标志
+    int flags=fcntl(fd,F_GETFL,0);
+    if (flags==-1) {
+        std::cerr << "获取 fcntl 标志失败！" << std::endl;
+        return;
+    }
+    // 在老标志基础上，追加 O_NONBLOCK (非阻塞) 标志
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
 
 // 模拟耗时的业务处理函数（运行在线程池中）
 void process_business(int client_fd,std::string request_msg) {
@@ -65,9 +79,9 @@ int main() {
         close(server_fd);
         return -1;
     }
-
     //把服务器的监听套接字加入到 epoll 实例中
     epoll_event ev{};
+    // 🔥 注意：监听套接字 server_fd 建议保持默认的水平触发(LT)，确保新连接不漏掉
     ev.events=EPOLLIN;      // 监听读事件（当有新客户端来连接时，server_fd 会触发读事件）
     ev.data.fd=server_fd;   // 把关联的 fd 存进去
 
@@ -108,39 +122,59 @@ int main() {
                 }
                 std::cout << "成功接受客户端连接，分配 fd: " << client_fd << std::endl;
 
+                // 🔥 关键修改 1：接受连接后，必须立刻将该客户端 fd 设为非阻塞
+                set_nonblocking(client_fd);
                 // 把这个新客户端的 client_fd 也注册到 epoll 监听名单里
                 epoll_event client_ev{};
-                client_ev.events=EPOLLIN;       // 依然监听它发消息
+                // 🔥 关键修改 2：注册事件时，显式加上 EPOLLET (边缘触发)
+                client_ev.events=EPOLLIN | EPOLLET;       // 依然监听它发消息
                 client_ev.data.fd=client_fd;
                 epoll_ctl(epoll_fd,EPOLL_CTL_ADD,client_fd,&client_ev);
                 std::cout << "【主线程】捕获新连接，已托管至 epoll，fd: " << client_fd << std::endl;
             }
             // 情况 B：如果是普通的 client_fd 有动静，说明【有客户端发消息过来了】
-            else if (events[i].events & EPOLLIN){
+            else if (events[i].events & EPOLLIN) {
                 char buffer[BUFFER_SIZE]={0};
-                ssize_t bytes_read=read(current_fd,buffer,sizeof(buffer)-1);
+                std::string total_req_str="";   //拼接数据
+                bool is_closed=false;           //标记客户端是否断开
+                // 🔥 关键修改 3：因为是 ET 模式，必须用 while(true) 循环读取，直到读空
+                while (true) {
+                    memset(buffer,0,sizeof(buffer));
+                    ssize_t bytes_read=read(current_fd,buffer,sizeof(buffer)-1);
 
-                if (bytes_read > 0) {
-                    std::cout << "【主线程】快速读取 fd " << current_fd << " 数据完毕，打包任务抛给线程池！" << std::endl;
+                    if (bytes_read>0)
+                        total_req_str+=buffer;
+                    else if (bytes_read==0) {
+                        // read 返回 0，代表客户端关闭了连接
+                        std::cout << "【主线程】监测到客户端下线，fd: " << current_fd << std::endl;
+                        is_closed = true;
+                        break; // 跳出读取循环
+                    }
+                    else {
+                        // read 返回 -1。在非阻塞模式下，需要根据 errno 错误码进一步判断
+                        // EAGAIN 或 EWOULDBLOCK 代表内核缓冲区已经空了，本次数据彻底读完了！
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            break; // 属于正常退出，数据读完了
+                        }
+                        // 如果是 EINTR，代表被系统信号中断，可以继续读，这里简单起见也按错误处理
+                        std::cerr << "读取 fd " << current_fd << " 发生异常错误，错误码: " << errno << std::endl;
+                        is_closed = true;
+                        break;
+                    }
+                }
 
-                    // 🔥 核心架构升级：将业务逻辑处理封装为 lambda 表达式，打包投递给线程池
-                    std::string req_str(buffer);
-                    pool.enqueue([current_fd, req_str]() {
-                        process_business(current_fd, req_str);
-                    });
-                }
-                // bytes_read == 0 代表客户端主动断开连接
-                else if (bytes_read == 0) {
-                    std::cout << "【客户端离线】fd " << current_fd << " 主动断开连接。" << std::endl;
-                    // 从 epoll 监听树中移除（高版本 Linux 传 NULL 即可）
-                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_fd, nullptr);
-                    close(current_fd); // 必须关闭 fd 释放系统资源
-                }
-                // 发生错误
-                else {
-                    std::cerr << "读取 fd " << current_fd << " 发生异常错误。" << std::endl;
-                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, current_fd, nullptr);
+                //退出循环后继续处理后续
+                if (is_closed) {
+                    epoll_ctl(epoll_fd,EPOLL_CTL_DEL,current_fd,nullptr);
                     close(current_fd);
+                }
+                else if (!total_req_str.empty()) {
+                    // 只有当真正读到了数据，才打包投递给线程池
+                    std::cout << "【主线程】ET循环读取 fd " << current_fd << " 完毕，大小: "
+                              << total_req_str.length() << " 字节。抛交线程池！" << std::endl;
+                    pool.enqueue([current_fd,total_req_str]() {
+                       process_business(current_fd,total_req_str);
+                    });
                 }
             }
         }
