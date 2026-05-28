@@ -31,45 +31,57 @@ void set_nonblocking(int fd) {
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-// 🔥 线程池中的核心业务：流式协议解码状态机
+// 🔥 【V9 动态路由版】：支持长连接连环解包 + 锁外长耗时加工 + 多维纵深安全防御
 void process_business(std::shared_ptr<Connection> conn) {
     std::vector<std::string> ready_messages;
     bool maflipped_packet=false;        //标记是否遭遇恶意攻击
-
+    // 步骤 A：短暂加锁，驱动状态机将缓冲区里的字节流数据进行齿轮跳转解析
     {
         std::lock_guard<std::mutex> lock(conn->buffer_mutex);
-        // 循环解析，直到缓冲区里的数据不够凑成一个完整的包
+
+        // 循环解析，直到缓冲区里的数据不够凑成一个完整的 HTTP 包（支持 Pipeline 长连接连环解包）
         while (true) {
-            // 1. 检查有没有满 4 字节的 Header
-            if (conn->read_buffer.readable_bytes()<4)
-                break;      //数据不够，下一次收包
-            // 2. 窥探前 4 字节，读出 Body 的目标长度
-            int raw_len=0;
-            std::memcpy(&raw_len,conn->read_buffer.peek(),4);
+            // 检查一：如果缓冲区被榨干读空了，直接退出循环
+            if (conn->read_buffer.readable_bytes()==0)
+                break;
 
-            // v7🔥 优化一：将网络字节序（大端）安全转换为当前主机字节序
-            int target_body_len = ntohl(raw_len);
-
-            // v7🔥 优化二：边界防御。包长度小于0或大于64KB，直接判定为恶意/畸形包
-            if (target_body_len > MAX_PACKET_SIZE || target_body_len < 0) {
-                std::cerr << "【安全警报】检测到非法畸形大包，长度: " << target_body_len
-                          << "，来自 fd: " << conn->fd << "。断开连接！" << std::endl;
-                maflipped_packet = true;
+            // 检查二【恶意攻击防御】：驱动有限状态机进行解析
+            // 如果 parse 返回 false，代表触发了 HttpParser 内部布下的 8KB 头部淹没洪水攻击防御
+            if (!conn->http_parser.parse(conn->read_buffer)) {
+                maflipped_packet=true;
                 break;
             }
 
-            // 3. 检查缓冲区里的剩余总数据，是否满足（Header 4字节 + Body 长度）
-            if (conn->read_buffer.readable_bytes()<(4+target_body_len))     // 发生了拆包：虽然拿到了长度，但身体还没完全传输过来
+            // 检查三：如果状态机本轮成功推到了 FINISH 状态，说明一个绝对完整的 HTTP 包躺在里面了
+            if (conn->http_parser.status()==HttpParser::PARSE_FINISH) {
+                // 纵深防御：核对 HTTP 协议内的 Content-Length 身体长度
+                std::string content_len_str=conn->http_parser.get_header("Content-Length");
+                if (!content_len_str.empty()) {
+                    try {
+                        int content_len=std::stoi(content_len_str);
+                        // 继承 V8 的硬核防御：如果恶意虚报 Body 长度超过 MAX_PACKET_SIZE (64KB) 或小于 0
+                        if (content_len > MAX_PACKET_SIZE || content_len < 0) {
+                            std::cerr << "【安全警报】fd " << conn->fd << " 虚报 Content-Length: "
+                                      << content_len << " 字节，触发纵深拉闸！" << std::endl;
+                            maflipped_packet = true;
+                            break;
+                        }
+                    }catch (...) {
+                        maflipped_packet=true;
+                        break;
+                    }
+                }
+                // 精准提取出本次请求的有效信息（例如客户端请求的 URL 路径），塞进 ready 队列
+                ready_messages.push_back(conn->http_parser.url());
+
+                // 🔥【核心复位】：由于 TCP 是字节流，为了让 while(true) 继续解析下一个长连接请求，
+                // 必须在把包拿走后，立刻将状态机重置回初始状态（PARSE_REQUESTLINE），满血迎接下一发数据
+                conn->http_parser.reset();
+            }else {
+                // 如果状态机状态不是 FINISH，说明遭遇了【流式拆包】：缓冲区有残余数据但不够凑成完整一包
+                // 退出循环，等主线程在 epoll 驱动下把下一次的数据追加进来
                 break;
-
-            // 4. 说明有一个绝对完整的包躺在里面了。先剥离 4 字节头部
-            conn->read_buffer.retrieve(4);
-            // 5. 精准提取出指定长度的 Body 数据
-            std::string request_msg(conn->read_buffer.peek(),target_body_len);
-            conn->read_buffer.retrieve(target_body_len);
-
-            ready_messages.push_back(request_msg);
-
+            }
         }
     }
     // 如果是恶意包，直接关闭套接字，主线程对应的 Map 会在下次读事件或心跳中彻底清理
@@ -78,12 +90,60 @@ void process_business(std::shared_ptr<Connection> conn) {
         return;
     }
     // 锁外执行业务逻辑
-    for (const auto& request_msg : ready_messages) {
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-        std::cout << "【工作线程】安全解码成功！内容: " << request_msg << std::endl;
+    for (const auto& url_path : ready_messages) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        std::cout << "【工作线程】安全解码成功！内容: " << url_path << std::endl;
 
-        std::string response = "v7收到了消息：" + request_msg;
-        send(conn->fd, response.c_str(), response.length(), 0);
+        std::string chat_prefix="/chat?msg=";
+        std::string http_response="";
+
+        // 🔀 路由分支 A：如果 URL 匹配到了我们的聊天特区暗号
+        if (url_path.find(chat_prefix) == 0) {
+            // 1. 提取出 `/chat?msg=` 后面的纯文本密文
+            std::string raw_msg=url_path.substr(chat_prefix.length());
+
+            // 2. 【新增防御】：URL 反向解码，将网络传输中的 %20 还原回空格 ' '
+            size_t pos;
+            while ((pos=raw_msg.find("%20"))!=std::string::npos)
+                raw_msg.replace(pos,3," ");
+            // 3. 组装干净的聊天文本响应体
+            std::string reply_body = "【V9 核心聊天回执】: " + raw_msg;
+            // 4. 打包成合规的 HTTP 协议头，Content-Type 声明为纯文本 text/plain
+            http_response =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/plain; charset=utf-8\r\n"
+                "Content-Length: " + std::to_string(reply_body.length()) + "\r\n"
+                "Connection: keep-alive\r\n"
+                "\r\n" +
+                reply_body;
+
+            std::cout << "【工作线程】成功投递聊天文本响应。" << std::endl;
+
+        }
+        else {
+            // 组装标准网页真实源码内容 (HTML Body)
+            std::string html_content =
+                "<html>"
+                "<head><title>Tiny-Reactor V9</title><meta charset='utf-8'></head>"
+                "<body style='background-color:#f0f2f5; font-family:sans-serif; text-align:center; padding-top:50px;'>"
+                "<h1 style='color:#1890ff;'>🚀  Tiny-Reactor V9 </h1>"
+                "<p style='color:#555;'>这是一个标准的单 Reactor 多线程异步 HTTP 服务器</p>"
+                "<div style='background:#fff; border-radius:8px; display:inline-block; padding:20px; box-shadow:0 4px 12px rgba(0,0,0,0.1);'>"
+                "<strong>当前运行模式：</strong> 边缘触发ET + 非阻塞I/O + 智能指针安全闭环 + 堆时钟定时器 + 手撕有限状态机"
+                "</div>"
+                "</body>"
+                "</html>";
+            // 严格遵循工业级 HTTP 规范，拼装合规的 HTTP 响应报文（包含状态行、响应头、空行、响应体）
+            std::string http_response =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/html; charset=utf-8\r\n"
+                "Content-Length: " + std::to_string(html_content.length()) + "\r\n"
+                "Connection: keep-alive\r\n"  // 明确支持长连接
+                "\r\n" +
+                html_content;
+        }
+        send(conn->fd,http_response.c_str(),http_response.length(),0);
+
     }
 
 }

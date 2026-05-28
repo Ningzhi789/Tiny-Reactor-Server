@@ -3,10 +3,11 @@ project(Tiny-Reactor-Server)
 
 set(CMAKE_CXX_STANDARD 20)
 
-add_executable(Tiny-Reactor-Server main.cpp
+add_executable(Tiny-Reactor-Server
         server.cpp
         client.cpp
         ThreadPool.hpp
         Connection.hpp
         Buffer.hpp
-        Timer.hpp)
+        Timer.hpp
+        HttpParser.hpp)

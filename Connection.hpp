@@ -5,16 +5,17 @@
 #include <unistd.h>
 #include "Buffer.hpp"
 #include <mutex>
-#include <chrono>           //v8新增 用于跟踪时间点
+#include <chrono>
+#include "HttpParser.hpp"
 
 class Connection {
 public:
     int fd;
     Buffer read_buffer;
     std::mutex buffer_mutex;
-
-    // 🔥 新增属性：本连接的真实绝对过期时间戳
     std::chrono::steady_clock::time_point expire_time;
+
+    HttpParser http_parser; // 🔥 v9新增：每个连接独享的状态机解析实例
     //构造函数
     explicit Connection(int client_fd):fd{client_fd} {
         std::cout << "【Connection 诞生】封装新 fd: " << fd << std::endl;

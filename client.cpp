@@ -45,25 +45,39 @@ int main() {
         if (input.empty())
             continue;
 
-        // 🔥 【V7 核心修改点】：打包流式协议报文（4字节 Header + Body）
-        uint32_t body_len=input.length();      // 1. 获取业务身体数据的绝对长度
-        uint32_t net_len=htonl(body_len);      // 2. 将本地字节序的整数转换为标准网络字节序（大端）
+        // 1. 【新增数据预处理】：空格转义。把句子里的普通空格 ' ' 换成安全传输符号 "%20"
+        std::string encoded_input="";
+        for (char c: input) {
+            if (c==' ')
+                encoded_input+="%20";
+            else
+                encoded_input+=c;
+        }
+        // 2. 【核心修改点】：不再打包二进制长度，而是将消息包装成纯文本的标准 HTTP GET 请求报文
+        // 注意：每一行都要以 \r\n 结尾，最后必须多加一个完整的 \r\n（空行）代表 HTTP 头部结束
+        std::string http_request =
+            "GET /chat?msg=" + encoded_input + " HTTP/1.1\r\n" +
+            "Host: 127.0.0.1:8088\r\n" +
+            "User-Agent: TerminalChatClient\r\n" +
+            "Connection: keep-alive\r\n" +
+            "\r\n";
 
-        // 3. 申请一个连续的动态缓冲区，大小刚好等于：4 字节头部 + 身体长度
-        std::vector<char> send_buf(4+body_len);
-
-        // 4. 精准拷贝：前 4 字节塞进长度标签，后面紧跟真正的文本内容
-        std::memcpy(send_buf.data(),&net_len,4);
-        std::memcpy(send_buf.data()+4,input.c_str(),body_len);
-        // 5. 将这块打包好的完整内存一次性安全发送出去
-        send(client_fd,send_buf.data(),send_buf.size(),0);
+        send(client_fd,http_request.c_str(),http_request.length(),0);
 
         memset(buffer,0,sizeof(buffer));
         ssize_t bytes_read=read(client_fd,buffer,sizeof(buffer)-1);
-        if (bytes_read>0)
-            std::cout<<buffer<<"\n";
-        else {
-            std::cout<<"断开连接"<<"\n";
+        if (bytes_read>0) {
+            std::string response_str(buffer,bytes_read);
+            // 4. 【核心协议过滤】：手撕解包，在客户端抹去死板的 HTTP 协议报头
+            // 寻找连续的两个换行符 "\r\n\r\n"（代表 HTTP 头部结束，真正干净的 Body 聊天数据开始）
+            size_t body_pos=response_str.find("\r\n");
+            if (body_pos!=std::string::npos) {
+                std::cout<<response_str.substr(body_pos+4)<<"\n\n";
+            }else {
+                std::cout << "收到未知格式响应：" << response_str << "\n\n";
+            }
+        }else {
+            std::cout << "服务器已断开连接" << "\n";
             break;
         }
 
