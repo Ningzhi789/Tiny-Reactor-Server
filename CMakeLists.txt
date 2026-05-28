@@ -8,4 +8,5 @@ add_executable(Tiny-Reactor-Server main.cpp
         client.cpp
         ThreadPool.hpp
         Connection.hpp
-        Buffer.hpp)
+        Buffer.hpp
+        Timer.hpp)

@@ -12,7 +12,8 @@
 #include <unordered_map>    //用于全局管理连接生命周期
 #include <memory>           //智能指针核心头文件
 #include "Connection.hpp"   //引入连接封装类
-#include <arpa/inet.h>      //v7新增 用于ntohl和htonl
+#include <arpa/inet.h>      //用于ntohl和htonl
+#include "Timer.hpp"
 
 const int MAX_PACKET_SIZE=65535;
 const int MAX_EVENTS=1024;
@@ -128,8 +129,14 @@ int main() {
 
     std::unordered_map<int,std::shared_ptr<Connection>> conn_map;
 
+    // v8新增 实例化一个定时器管理器
+    TimerManager timer_manager;
+
     while (true) {
-        int nfds=epoll_wait(epoll_fd,events,MAX_EVENTS,-1);
+        // 🔥 v8 关键重构点：把最后一个参数从 -1 (永久阻塞) 改为 1000 (1秒超时醒来一次)
+        // 这样即使没有任何网络网络事件发生，主线程每隔 1 秒也会自动醒来，执行下面的僵尸清理
+
+        int nfds=epoll_wait(epoll_fd,events,MAX_EVENTS,1000);
         if (nfds == -1) {
             std::cerr << "epoll_wait 错误！" << std::endl;
             break;
@@ -156,6 +163,8 @@ int main() {
                 auto conn = std::make_shared<Connection>(client_fd);
                 conn_map[client_fd]=conn;
 
+                // 🔥 v8关键重构点：新连接注册成功后，立刻为其绑定一个 15 秒过期的定时器
+                timer_manager.add_timer(conn,15);
                 // 把这个新客户端的 client_fd 也注册到 epoll 监听名单里
                 epoll_event client_ev{};
                 // 注册事件时，显式加上 EPOLLET (边缘触发)
@@ -170,6 +179,9 @@ int main() {
                 if (conn_map.find(current_fd)==conn_map.end())
                     continue;
                 auto conn=conn_map[current_fd];
+
+                // 🔥 v8关键重构点：只要客户端有数据交互，说明它还活着，立刻为其“续命” 15 秒！
+                timer_manager.add_timer(conn, 15);
 
                 char buffer[BUFFER_SIZE]={0};
                 std::string total_req_str="";   //拼接数据
@@ -216,6 +228,8 @@ int main() {
                 }
             }
         }
+        // 🔥 【V8 核心大招】：每轮事件处理完或 1 秒超时醒来，主线程雷打不动地执行一次堆顶盘点
+        timer_manager.handle_expired_timers(conn_map, epoll_fd);
     }
 
     // 8.close

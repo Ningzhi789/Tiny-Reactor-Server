@@ -3,15 +3,18 @@
 
 #include <iostream>
 #include <unistd.h>
-#include "Buffer.hpp"       //v7新增，引入自己的缓冲区
-#include <mutex>            //v7新增
+#include "Buffer.hpp"
+#include <mutex>
+#include <chrono>           //v8新增 用于跟踪时间点
 
 class Connection {
 public:
     int fd;
-    Buffer read_buffer;     //每个连接独享的应用层接收缓冲区
-    std::mutex buffer_mutex;        // v7必须加上这把互斥锁，用来保护上面的 read_buffer
+    Buffer read_buffer;
+    std::mutex buffer_mutex;
 
+    // 🔥 新增属性：本连接的真实绝对过期时间戳
+    std::chrono::steady_clock::time_point expire_time;
     //构造函数
     explicit Connection(int client_fd):fd{client_fd} {
         std::cout << "【Connection 诞生】封装新 fd: " << fd << std::endl;
