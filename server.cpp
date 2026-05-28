@@ -14,6 +14,7 @@
 #include "Connection.hpp"   //引入连接封装类
 #include <arpa/inet.h>      //用于ntohl和htonl
 #include "Timer.hpp"
+#include "Logger.hpp"
 
 const int MAX_PACKET_SIZE=65535;
 const int MAX_EVENTS=1024;
@@ -92,7 +93,8 @@ void process_business(std::shared_ptr<Connection> conn) {
     // 锁外执行业务逻辑
     for (const auto& url_path : ready_messages) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
-        std::cout << "【工作线程】安全解码成功！内容: " << url_path << std::endl;
+        LOG_INFO("【工作线程】安全解码成功！内容: "+url_path);
+        //std::cout << "【工作线程】安全解码成功！内容: " << url_path << std::endl;
 
         std::string chat_prefix="/chat?msg=";
         std::string http_response="";
@@ -117,7 +119,8 @@ void process_business(std::shared_ptr<Connection> conn) {
                 "\r\n" +
                 reply_body;
 
-            std::cout << "【工作线程】成功投递聊天文本响应。" << std::endl;
+            //std::cout << "【工作线程】成功投递聊天文本响应。" << std::endl;
+            LOG_INFO("【工作线程】成功投递聊天文本响应。");
 
         }
         else {
@@ -134,7 +137,7 @@ void process_business(std::shared_ptr<Connection> conn) {
                 "</body>"
                 "</html>";
             // 严格遵循工业级 HTTP 规范，拼装合规的 HTTP 响应报文（包含状态行、响应头、空行、响应体）
-            std::string http_response =
+            http_response =
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: text/html; charset=utf-8\r\n"
                 "Content-Length: " + std::to_string(html_content.length()) + "\r\n"
@@ -149,6 +152,10 @@ void process_business(std::shared_ptr<Connection> conn) {
 }
 
 int main() {
+
+    // 初始化双缓冲日志引擎，所有的日志将被打入当前目录下的 server.log 文件中
+    Logger::getInstance().init("server.log");
+    LOG_INFO("========== Tiny-Reactor 异步日志系统成功启动 ==========");
     // 1.socket
     int server_fd=socket(AF_INET,SOCK_STREAM,0);
     //设置端口复用
@@ -215,7 +222,8 @@ int main() {
                     std::cerr << "接受新连接失败！" << std::endl;
                     continue;
                 }
-                std::cout << "成功接受客户端连接，分配 fd: " << client_fd << std::endl;
+                LOG_INFO("成功接受客户端连接，分配 fd: "+std::to_string(client_fd));
+                //std::cout <<  "成功接受客户端连接，分配 fd: "<< client_fd << std::endl;
 
                 // 接受连接后，必须立刻将该客户端 fd 设为非阻塞
                 set_nonblocking(client_fd);
@@ -231,7 +239,8 @@ int main() {
                 client_ev.events=EPOLLIN | EPOLLET;       // 依然监听它发消息
                 client_ev.data.fd=client_fd;
                 epoll_ctl(epoll_fd,EPOLL_CTL_ADD,client_fd,&client_ev);
-                std::cout << "【主线程】捕获新连接，已托管至 epoll，fd: " << client_fd << std::endl;
+                LOG_INFO("【主线程】捕获新连接，已托管至 epoll，fd: "+std::to_string(client_fd));
+                //std::cout << "【主线程】捕获新连接，已托管至 epoll，fd: " << client_fd << std::endl;
             }
             // 情况 B：如果是普通的 client_fd 有动静
             else if (events[i].events & EPOLLIN) {
@@ -256,7 +265,8 @@ int main() {
                         conn->read_buffer.append(buffer,bytes_read);
                     else if (bytes_read==0) {
                         // read 返回 0，代表客户端关闭了连接
-                        std::cout << "【主线程】监测到客户端下线，fd: " << current_fd << std::endl;
+                        LOG_INFO("【主线程】监测到客户端下线，fd: "+std::to_string(current_fd));
+                        // std::cout << "【主线程】监测到客户端下线，fd: " << current_fd << std::endl;
                         is_closed = true;
                         break; // 跳出读取循环
                     }
@@ -278,7 +288,8 @@ int main() {
                     // 注意：此时主线程绝对不手工调用 close(current_fd)！
                     epoll_ctl(epoll_fd,EPOLL_CTL_DEL,current_fd,nullptr);
                     conn_map.erase(current_fd);
-                    std::cout << "【主线程】已将 fd " << current_fd << " 从全局 Map 中解绑。" << std::endl;
+                    LOG_INFO("【主线程】已删除 fd: "+std::to_string(current_fd)+"从全局 Map 中解绑。 ");
+                    //std::cout << "【主线程】已将 fd " << current_fd << " 从全局 Map 中解绑。" << std::endl;
                 }
                 else {
 

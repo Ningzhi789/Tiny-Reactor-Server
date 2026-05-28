@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <iostream>
 #include "Buffer.hpp"
+#include "Logger.hpp"
 
 constexpr size_t MAX_HEADER_LIMIT = 8192;
 
@@ -112,7 +113,8 @@ private:
         url_=std::string(s1+1,s2);
         version_=std::string(s2+1,line.end());
 
-        std::cout << "【FSM状态机】解析请求行成功! Method: " << method_ << ", URL: " << url_ << std::endl;
+        LOG_INFO("【FSM状态机】解析请求行成功! Method: " + method_ +", URL: " + url_);
+        //std::cout << "【FSM状态机】解析请求行成功! Method: " << method_ << ", URL: " << url_ << std::endl;
         return true;
     }
 

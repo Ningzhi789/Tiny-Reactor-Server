@@ -10,4 +10,5 @@ add_executable(Tiny-Reactor-Server
         Connection.hpp
         Buffer.hpp
         Timer.hpp
-        HttpParser.hpp)
+        HttpParser.hpp
+        Logger.hpp)

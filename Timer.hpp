@@ -10,6 +10,7 @@
 #include <iostream>
 
 #include "Connection.hpp"
+#include "Logger.hpp"
 
 // 前向声明 Connection 类，避免头文件循环包含
 class Connection;
@@ -68,7 +69,8 @@ inline void TimerManager::handle_expired_timers(std::unordered_map<int,std::shar
             // 🔥 【惰性删除核心判断】：
             // 如果连接对象的当前真实过期时间 和 堆顶这个节点的时间完全一致，说明它期间没说过话，是真的超时了！
             if (conn->expire_time == top.expire_time) {
-                std::cout << "【安全防御】检测到僵尸连接超时，正在强制踢人！fd: " << conn->fd << std::endl;
+                LOG_INFO("【安全防御】检测到僵尸连接超时，正在强制踢人！fd: "+std::to_string(conn->fd));
+                //std::cout << "【安全防御】检测到僵尸连接超时，正在强制踢人！fd: " << conn->fd << std::endl;
                 // 从系统多路复用树中摘除，并从全局资产 Map 中抹去
                 epoll_ctl(epoll_fd,EPOLL_CTL_DEL,conn->fd,nullptr);
                 conn_map.erase(conn->fd);

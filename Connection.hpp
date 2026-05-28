@@ -7,6 +7,7 @@
 #include <mutex>
 #include <chrono>
 #include "HttpParser.hpp"
+#include "Logger.hpp"
 
 class Connection {
 public:
@@ -18,13 +19,15 @@ public:
     HttpParser http_parser; // 🔥 v9新增：每个连接独享的状态机解析实例
     //构造函数
     explicit Connection(int client_fd):fd{client_fd} {
-        std::cout << "【Connection 诞生】封装新 fd: " << fd << std::endl;
+        LOG_INFO("【Connection 诞生】封装新 fd: "+std::to_string(fd));
+        //std::cout << "【Connection 诞生】封装新 fd: " << fd << std::endl;
     }
 
     //析构函数
     ~Connection() {
         if (fd!=-1) {
-            std::cout << "【Connection 析构】引用计数归零！fd " << fd << " 真正释放资源并执行 close()" << std::endl;
+            LOG_INFO("【Connection 析构】引用计数归零！fd " + std::to_string(fd)+ " 释放资源并执行 close()");
+            //std::cout << "【Connection 析构】引用计数归零！fd " << fd << " 真正释放资源并执行 close()" << std::endl;
             close(fd);
         }
     }
