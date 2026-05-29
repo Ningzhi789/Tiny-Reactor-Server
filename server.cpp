@@ -17,6 +17,8 @@
 #include "Logger.hpp"
 #include "MysqlConnPool.hpp"
 #include "SubReactor.hpp"
+#include <sys/sendfile.h>   // V12 零拷贝必备系统调用
+#include <sys/stat.h>       // 获取静态文件状态（大小）必备
 
 const int MAX_PACKET_SIZE=65535;
 const int MAX_EVENTS=1024;
@@ -121,16 +123,29 @@ void process_business(std::shared_ptr<Connection> conn) {
                 ConnectionRAII mysql_guard(&mysql_conn);        // 🌟 构造函数内自动向池子借出一条连接
 
                 if (mysql_conn) {
-                    // 组装一条安全的 SQL 插入语句，把聊天消息持久化到 chat_log 表中
-                    std::string sql_query = "INSERT INTO chat_log(message, chat_time) VALUES('" + raw_msg + "', NOW());";
+                    // V12 工业级安全落地：利用预编译参数化查询（Prepare Statement）隔离数据与指令
+                    MYSQL_STMT* stmt=mysql_stmt_init(mysql_conn);
 
-                    if (mysql_query(mysql_conn,sql_query.c_str())==0) {
-                        LOG_INFO("成功将聊天记录持久化写入 MySQL 数据库。");
+                    // 1. 将带有 ? 占位符的 SQL 骨架送入内核锁定语法树
+                    std::string sql="INSERT INTO chat_log(message, chat_time) VALUES(?, NOW());";
+                    mysql_stmt_prepare(stmt,sql.c_str(),sql.length());
+
+                    // 2. 绑定具体的变量参数
+                    MYSQL_BIND bind[1];
+                    memset(bind,0,sizeof(bind));
+                    bind[0].buffer_type=MYSQL_TYPE_STRING;
+                    bind[0].buffer=(char*)raw_msg.c_str();
+                    bind[0].buffer_length=raw_msg.length();
+
+                    // 3. 安全注入并物理执行
+                    mysql_stmt_bind_param(stmt,bind);
+                    if (mysql_stmt_execute(stmt) == 0) {
+                        LOG_INFO("成功利用 STMT 预编译机制将聊天记录安全持久化。");
                     } else {
-                        LOG_ERROR("SQL 语句执行失败！原因: " + std::string(mysql_error(mysql_conn)));
+                        LOG_ERROR("STMT 执行失败！错误: " + std::string(mysql_stmt_error(stmt)));
                     }
+                    mysql_stmt_close(stmt);
                 }
-
             }
 
             // 3. 组装干净的聊天文本响应体
@@ -146,34 +161,33 @@ void process_business(std::shared_ptr<Connection> conn) {
 
             //std::cout << "【工作线程】成功投递聊天文本响应。" << std::endl;
             LOG_INFO("【工作线程】成功投递聊天文本响应。");
+            send(conn->fd, http_response.c_str(), http_response.length(), 0);
+        }else {
+            LOG_INFO("【工作线程】收到静态网页请求，执行 sendfile 零拷贝下发。");
 
-        }
-        else {
-            // 组装标准网页真实源码内容 (HTML Body)
-            std::string html_content =
-                "<html>"
-                "<head><title>Tiny-Reactor V9</title><meta charset='utf-8'></head>"
-                "<body style='background-color:#f0f2f5; font-family:sans-serif; text-align:center; padding-top:50px;'>"
-                "<h1 style='color:#1890ff;'>🚀  Tiny-Reactor V9 </h1>"
-                "<p style='color:#555;'>这是一个标准的单 Reactor 多线程异步 HTTP 服务器</p>"
-                "<div style='background:#fff; border-radius:8px; display:inline-block; padding:20px; box-shadow:0 4px 12px rgba(0,0,0,0.1);'>"
-                "<strong>当前运行模式：</strong> 边缘触发ET + 非阻塞I/O + 智能指针安全闭环 + 堆时钟定时器 + 手撕有限状态机"
-                "</div>"
-                "</body>"
-                "</html>";
-            // 严格遵循工业级 HTTP 规范，拼装合规的 HTTP 响应报文（包含状态行、响应头、空行、响应体）
-            http_response =
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: text/html; charset=utf-8\r\n"
-                "Content-Length: " + std::to_string(html_content.length()) + "\r\n"
-                "Connection: keep-alive\r\n"  // 明确支持长连接
-                "\r\n" +
-                html_content;
-        }
-        send(conn->fd,http_response.c_str(),http_response.length(),0);
+            // 💡 提示：需要在服务器同级目录下提前新建一个真实的文本文件 index.html
+            std::string filepath="index.html";
+            int file_fd=open(filepath.c_str(),O_RDONLY);
+            if (file_fd==-1) {
+                std::string err_404 = "HTTP/1.1 404 NOT FOUND\r\nContent-Length: 0\r\n\r\n";
+                send(conn->fd, err_404.c_str(), err_404.length(), 0);
+                return;
+            }
 
+            struct stat stat_buf;
+            fstat(file_fd, &stat_buf);
+
+            // ① 发送标准的 HTTP 协议报头
+            std::string header = "HTTP/1.1 200 OK\r\n"
+                             "Content-Type: text/html; charset=utf-8\r\n"
+                             "Content-Length: " + std::to_string(stat_buf.st_size) + "\r\n"
+                             "Connection: keep-alive\r\n\r\n";
+            send(conn->fd,header.c_str(),header.length(),0);
+            // ② 核心：sendfile 零拷贝系统调用，数据不经过用户态，内核直接完成倒手分发
+            sendfile(conn->fd,file_fd,nullptr,stat_buf.st_size);
+            close(file_fd);
+        }
     }
-
 }
 
 int main() {
