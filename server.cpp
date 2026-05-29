@@ -16,11 +16,13 @@
 #include "Timer.hpp"
 #include "Logger.hpp"
 #include "MysqlConnPool.hpp"
+#include "SubReactor.hpp"
 
 const int MAX_PACKET_SIZE=65535;
 const int MAX_EVENTS=1024;
 const int BUFFER_SIZE=1024;
 
+ThreadPool* g_pool =nullptr;
 
 void set_nonblocking(int fd) {
     //获取老标志
@@ -33,7 +35,7 @@ void set_nonblocking(int fd) {
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-// 🔥 【V9 动态路由版】：支持长连接连环解包 + 锁外长耗时加工 + 多维纵深安全防御
+// 🔥 【V12 动态路由版】：工作线程被唤醒后，直接持锁执行解析、SQL落地和回执发送
 void process_business(std::shared_ptr<Connection> conn) {
     std::vector<std::string> ready_messages;
     bool maflipped_packet=false;        //标记是否遭遇恶意攻击
@@ -206,7 +208,6 @@ int main() {
     std::cout<<"listening 8088"<<"\n";
 
     // 创建epoll实例
-    // epoll_create1(0) 是现代 Linux 推荐写法
     int epoll_fd=epoll_create1(0);
     //把服务器的监听套接字加入到 epoll 实例中
     epoll_event ev{};
@@ -221,19 +222,26 @@ int main() {
         return -1;
     }
 
+
     // 初始化一个拥有 4 个核心工作线程的线程池
     ThreadPool pool(4);
     epoll_event events[MAX_EVENTS];
+    g_pool=&pool;
+    // 筑巢子 Reactor 池：根据 CPU 核心数启动 3 个独立的 I/O 子线程
+    const int SUB_REACTOR_NUM=3;
+    std::vector<std::unique_ptr<SubReactor>> sub_reactors;
+    for (int i=0;i<SUB_REACTOR_NUM;i++) {
+        sub_reactors.push_back(std::make_unique<SubReactor>());
+        sub_reactors[i]->start();   // 驱动各个子 Reactor 事件死循环运转
+    }
+    int rr_index=0;     // 用于 Round-Robin 轮询分发的递增游标
 
-    std::unordered_map<int,std::shared_ptr<Connection>> conn_map;
+    // std::unordered_map<int,std::shared_ptr<Connection>> conn_map;
+    // TimerManager timer_manager;
 
-    // v8新增 实例化一个定时器管理器
-    TimerManager timer_manager;
-
+    // 主 Reactor 纯净的专属事件死循环
     while (true) {
-        // 🔥 v8 关键重构点：把最后一个参数从 -1 (永久阻塞) 改为 1000 (1秒超时醒来一次)
-        // 这样即使没有任何网络网络事件发生，主线程每隔 1 秒也会自动醒来，执行下面的僵尸清理
-
+        // 主线程永久阻塞死守监听套接字即可，再也无需兼顾僵尸清理，彻底解放
         int nfds=epoll_wait(epoll_fd,events,MAX_EVENTS,1000);
         if (nfds == -1) {
             std::cerr << "epoll_wait 错误！" << std::endl;
@@ -244,7 +252,7 @@ int main() {
         for (int i=0;i<nfds;i++) {
             int current_fd=events[i].data.fd;
 
-            // 情况 A：如果是 server_fd 有动静
+            // 主线程唯一关心的动静：8088 端口新客户敲门
             if (current_fd==server_fd) {
                 sockaddr_in client_addr{};
                 socklen_t client_len=sizeof(client_addr);
@@ -260,78 +268,13 @@ int main() {
                 set_nonblocking(client_fd);
 
                 auto conn = std::make_shared<Connection>(client_fd);
-                conn_map[client_fd]=conn;
 
-                // 🔥 v8关键重构点：新连接注册成功后，立刻为其绑定一个 15 秒过期的定时器
-                timer_manager.add_timer(conn,15);
-                // 把这个新客户端的 client_fd 也注册到 epoll 监听名单里
-                epoll_event client_ev{};
-                // 注册事件时，显式加上 EPOLLET (边缘触发)
-                client_ev.events=EPOLLIN | EPOLLET;       // 依然监听它发消息
-                client_ev.data.fd=client_fd;
-                epoll_ctl(epoll_fd,EPOLL_CTL_ADD,client_fd,&client_ev);
-                LOG_INFO("【主线程】捕获新连接，已托管至 epoll，fd: "+std::to_string(client_fd));
-                //std::cout << "【主线程】捕获新连接，已托管至 epoll，fd: " << client_fd << std::endl;
-            }
-            // 情况 B：如果是普通的 client_fd 有动静
-            else if (events[i].events & EPOLLIN) {
-                // 先从 Map 里安全地取出这个连接的智能指针
-                if (conn_map.find(current_fd)==conn_map.end())
-                    continue;
-                auto conn=conn_map[current_fd];
-
-                // 🔥 v8关键重构点：只要客户端有数据交互，说明它还活着，立刻为其“续命” 15 秒！
-                timer_manager.add_timer(conn, 15);
-
-                char buffer[BUFFER_SIZE]={0};
-                std::string total_req_str="";   //拼接数据
-                bool is_closed=false;           //标记客户端是否断开
-
-                // 🔥 v7主线程职责非常纯粹：利用 ET 模式疯狂卸货，全部追加进连接的内部 Buffer
-                while (true) {
-                    memset(buffer,0,sizeof(buffer));
-                    ssize_t bytes_read=read(current_fd,buffer,sizeof(buffer)-1);
-
-                    if (bytes_read>0)
-                        conn->read_buffer.append(buffer,bytes_read);
-                    else if (bytes_read==0) {
-                        // read 返回 0，代表客户端关闭了连接
-                        LOG_INFO("【主线程】监测到客户端下线，fd: "+std::to_string(current_fd));
-                        // std::cout << "【主线程】监测到客户端下线，fd: " << current_fd << std::endl;
-                        is_closed = true;
-                        break; // 跳出读取循环
-                    }
-                    else {
-                        // read 返回 -1。在非阻塞模式下，需要根据 errno 错误码进一步判断
-                        // EAGAIN 或 EWOULDBLOCK 代表内核缓冲区已经空了，本次数据彻底读完了！
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            break; // 属于正常退出，数据读完了
-                        }
-                        // 如果是 EINTR，代表被系统信号中断，可以继续读，这里简单起见也按错误处理
-                        std::cerr << "读取 fd " << current_fd << " 发生异常错误，错误码: " << errno << std::endl;
-                        is_closed = true;
-                        break;
-                    }
-                }
-
-                //退出循环后继续处理后续
-                if (is_closed) {
-                    // 注意：此时主线程绝对不手工调用 close(current_fd)！
-                    epoll_ctl(epoll_fd,EPOLL_CTL_DEL,current_fd,nullptr);
-                    conn_map.erase(current_fd);
-                    LOG_INFO("【主线程】已删除 fd: "+std::to_string(current_fd)+"从全局 Map 中解绑。 ");
-                    //std::cout << "【主线程】已将 fd " << current_fd << " 从全局 Map 中解绑。" << std::endl;
-                }
-                else {
-
-                    pool.enqueue([conn]() {
-                       process_business(conn);
-                    });
-                }
+                // 👑 核心派发：扔给选中的子 Reactor 托管，并自增 rr_index 游标
+                sub_reactors[rr_index]->dispatch_connection(conn);
+                LOG_INFO("【主线程】已将 fd " + std::to_string(client_fd) + " 委派至子 Reactor [" + std::to_string(rr_index) + "]");
+                rr_index=(rr_index+1)%SUB_REACTOR_NUM;
             }
         }
-        // 🔥 【V8 核心大招】：每轮事件处理完或 1 秒超时醒来，主线程雷打不动地执行一次堆顶盘点
-        timer_manager.handle_expired_timers(conn_map, epoll_fd);
     }
 
     // 8.close

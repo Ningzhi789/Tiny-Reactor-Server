@@ -12,4 +12,5 @@ add_executable(Tiny-Reactor-Server
         Timer.hpp
         HttpParser.hpp
         Logger.hpp
-        MysqlConnPool.hpp)
+        MysqlConnPool.hpp
+        SubReactor.hpp)

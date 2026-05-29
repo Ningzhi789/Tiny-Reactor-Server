@@ -13,3 +13,4 @@ server.log
 .idea/
 *.swp
 .DS_Store
+.claude/
