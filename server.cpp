@@ -15,6 +15,7 @@
 #include <arpa/inet.h>      //用于ntohl和htonl
 #include "Timer.hpp"
 #include "Logger.hpp"
+#include "MysqlConnPool.hpp"
 
 const int MAX_PACKET_SIZE=65535;
 const int MAX_EVENTS=1024;
@@ -78,6 +79,9 @@ void process_business(std::shared_ptr<Connection> conn) {
                 // 🔥【核心复位】：由于 TCP 是字节流，为了让 while(true) 继续解析下一个长连接请求，
                 // 必须在把包拿走后，立刻将状态机重置回初始状态（PARSE_REQUESTLINE），满血迎接下一发数据
                 conn->http_parser.reset();
+                // 🔥【铁律修复】：成功解析完一包后，必须将已被消费的缓冲区彻底清空！
+                // 这样下一轮循环时 readable_bytes() 就会归零，从而清脆地 break 弹出循环
+
             }else {
                 // 如果状态机状态不是 FINISH，说明遭遇了【流式拆包】：缓冲区有残余数据但不够凑成完整一包
                 // 退出循环，等主线程在 epoll 驱动下把下一次的数据追加进来
@@ -92,7 +96,7 @@ void process_business(std::shared_ptr<Connection> conn) {
     }
     // 锁外执行业务逻辑
     for (const auto& url_path : ready_messages) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        // std::this_thread::sleep_for(std::chrono::seconds(1));
         LOG_INFO("【工作线程】安全解码成功！内容: "+url_path);
         //std::cout << "【工作线程】安全解码成功！内容: " << url_path << std::endl;
 
@@ -108,6 +112,25 @@ void process_business(std::shared_ptr<Connection> conn) {
             size_t pos;
             while ((pos=raw_msg.find("%20"))!=std::string::npos)
                 raw_msg.replace(pos,3," ");
+
+            // 🛡️【v11新增工业级数据落地】：利用 RAII 机制安全借出连接
+            MYSQL* mysql_conn=nullptr;
+            {
+                ConnectionRAII mysql_guard(&mysql_conn);        // 🌟 构造函数内自动向池子借出一条连接
+
+                if (mysql_conn) {
+                    // 组装一条安全的 SQL 插入语句，把聊天消息持久化到 chat_log 表中
+                    std::string sql_query = "INSERT INTO chat_log(message, chat_time) VALUES('" + raw_msg + "', NOW());";
+
+                    if (mysql_query(mysql_conn,sql_query.c_str())==0) {
+                        LOG_INFO("成功将聊天记录持久化写入 MySQL 数据库。");
+                    } else {
+                        LOG_ERROR("SQL 语句执行失败！原因: " + std::string(mysql_error(mysql_conn)));
+                    }
+                }
+
+            }
+
             // 3. 组装干净的聊天文本响应体
             std::string reply_body = "【V9 核心聊天回执】: " + raw_msg;
             // 4. 打包成合规的 HTTP 协议头，Content-Type 声明为纯文本 text/plain
@@ -156,6 +179,14 @@ int main() {
     // 初始化双缓冲日志引擎，所有的日志将被打入当前目录下的 server.log 文件中
     Logger::getInstance().init("server.log");
     LOG_INFO("========== Tiny-Reactor 异步日志系统成功启动 ==========");
+
+    // 🔥【v11新增】：启动并创建 8 个 MySQL 物理连接的动态复用池
+    // 请根据 Linux 本地的实际数据库配置修改：IP, 用户名, 密码, 数据库名, 端口, 连接数
+    if (!MysqlConnPool::getInstance().init("127.0.0.1", "root", "root", "chat_db", 3306, 8)) {
+        LOG_ERROR("数据库连接池启动失败，服务器拉闸！");
+        return -1;
+    }
+
     // 1.socket
     int server_fd=socket(AF_INET,SOCK_STREAM,0);
     //设置端口复用

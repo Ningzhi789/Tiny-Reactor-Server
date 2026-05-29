@@ -11,4 +11,5 @@ add_executable(Tiny-Reactor-Server
         Buffer.hpp
         Timer.hpp
         HttpParser.hpp
-        Logger.hpp)
+        Logger.hpp
+        MysqlConnPool.hpp)

@@ -1,12 +1,15 @@
-# 忽略 CLion 配置文件
-.idea/
-
-# 忽略 CMake 编译生成的文件夹
-cmake-build-debug/
-cmake-build-release/
-build/
-
-# 忽略编译出来的二进制可执行文件
+# 1. 过滤编译生成的二进制文件与中间件
 server
 client
 *.o
+*.out
+
+# 2. 过滤运行时生成的本地异步日志
+*.log
+server.log
+
+# 3. 过滤系统与 IDE 临时缓存
+.vscode/
+.idea/
+*.swp
+.DS_Store
