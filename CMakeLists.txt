@@ -3,9 +3,11 @@ project(Tiny-Reactor-Server)
 
 set(CMAKE_CXX_STANDARD 20)
 
+find_package(OpenSSL REQUIRED)
+
+# 服务端
 add_executable(Tiny-Reactor-Server
         server.cpp
-        client.cpp
         ThreadPool.hpp
         Connection.hpp
         Buffer.hpp
@@ -14,3 +16,16 @@ add_executable(Tiny-Reactor-Server
         Logger.hpp
         MysqlConnPool.hpp
         SubReactor.hpp)
+
+target_link_libraries(Tiny-Reactor-Server
+        mysqlclient
+        pthread
+        ${OPENSSL_LIBRARIES})
+
+# 客户端
+add_executable(client
+        client.cpp)
+
+target_link_libraries(client
+        pthread
+        ${OPENSSL_LIBRARIES})

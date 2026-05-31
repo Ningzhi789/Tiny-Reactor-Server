@@ -5,13 +5,25 @@
 #include <netinet/in.h>
 #include <unistd.h>
 #include <vector>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
+// 注意：客户端不使用服务端的 Logger（未调用 init() 会导致 segfault）
 
 
 int main() {
+    // OpenSSL 1.1.0+ 自动初始化，无需手动调用 SSL_library_init()
+    SSL_CTX* client_ctx = SSL_CTX_new(TLS_client_method());
+    if (!client_ctx) {
+        std::cerr << "SSL_CTX_new 失败！OpenSSL 未正确初始化。" << std::endl;
+        ERR_print_errors_fp(stderr);
+        return -1;
+    }
     //  1.socket
     int client_fd=socket(AF_INET,SOCK_STREAM,0);
     if (client_fd==-1) {
-        std::cout<<"socket failed"<<"\n";
+        std::cerr<<"socket failed"<<"\n";
+        SSL_CTX_free(client_ctx);
         return -1;
     }
 
@@ -23,17 +35,37 @@ int main() {
     if (inet_pton(AF_INET,"127.0.0.1",&server_addr.sin_addr)<=0) {
         std::cerr<<"address error"<<"\n";
         close(client_fd);
+        SSL_CTX_free(client_ctx);
         return -1;
     }
 
     // 3. connect
     if (connect(client_fd,(struct sockaddr*)&server_addr,sizeof(server_addr))<0) {
-        std::cout<<"connect failed"<<"\n";
+        std::cerr<<"connect failed"<<"\n";
         close(client_fd);
+        SSL_CTX_free(client_ctx);
         return -1;
     }
     std::cout<<"连接成功"<<"\n";
-
+    // TLS安全握手
+    SSL* ssl=SSL_new(client_ctx);
+    if (!ssl) {
+        std::cerr << "SSL_new 失败！" << std::endl;
+        ERR_print_errors_fp(stderr);
+        close(client_fd);
+        SSL_CTX_free(client_ctx);
+        return -1;
+    }
+    SSL_set_fd(ssl,client_fd);
+    if (SSL_connect(ssl) <= 0) {
+        std::cerr << "SSL 握手失败！" << std::endl;
+        ERR_print_errors_fp(stderr);
+        SSL_free(ssl);
+        close(client_fd);
+        SSL_CTX_free(client_ctx);
+        return -1;
+    }
+    std::cout << "TLS 安全加密隧道建立成功！" << std::endl;
     // 4. send
     std::string input;
     char buffer[1024];
@@ -62,10 +94,10 @@ int main() {
             "Connection: keep-alive\r\n" +
             "\r\n";
 
-        send(client_fd,http_request.c_str(),http_request.length(),0);
+        SSL_write(ssl,http_request.c_str(),http_request.length());
 
         memset(buffer,0,sizeof(buffer));
-        ssize_t bytes_read=read(client_fd,buffer,sizeof(buffer)-1);
+        ssize_t bytes_read = SSL_read(ssl, buffer, sizeof(buffer) - 1);
         if (bytes_read>0) {
             std::string response_str(buffer,bytes_read);
             // 4. 【核心协议过滤】：手撕解包，在客户端抹去死板的 HTTP 协议报头
@@ -85,7 +117,10 @@ int main() {
 
 
     // 6.close
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
     close(client_fd);
+    SSL_CTX_free(client_ctx);
     std::cout<<"close"<<"\n";
 
     return 0;

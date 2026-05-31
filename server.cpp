@@ -19,12 +19,16 @@
 #include "SubReactor.hpp"
 #include <sys/sendfile.h>   // V12 零拷贝必备系统调用
 #include <sys/stat.h>       // 获取静态文件状态（大小）必备
+#include <sys/stat.h>       // 用于读取网页文件属性
+#include <openssl/ssl.h>    // 引入 SSL 核心
+#include <openssl/err.h>    // 增加这行
 
 const int MAX_PACKET_SIZE=65535;
 const int MAX_EVENTS=1024;
 const int BUFFER_SIZE=1024;
 
 ThreadPool* g_pool =nullptr;
+SSL_CTX* g_ssl_ctx=nullptr;
 
 void set_nonblocking(int fd) {
     //获取老标志
@@ -101,7 +105,7 @@ void process_business(std::shared_ptr<Connection> conn) {
     // 锁外执行业务逻辑
     for (const auto& url_path : ready_messages) {
         // std::this_thread::sleep_for(std::chrono::seconds(1));
-        LOG_INFO("【工作线程】安全解码成功！内容: "+url_path);
+        LOG_INFO("Worker decoded msg: " + url_path);
         //std::cout << "【工作线程】安全解码成功！内容: " << url_path << std::endl;
 
         std::string chat_prefix="/chat?msg=";
@@ -140,9 +144,9 @@ void process_business(std::shared_ptr<Connection> conn) {
                     // 3. 安全注入并物理执行
                     mysql_stmt_bind_param(stmt,bind);
                     if (mysql_stmt_execute(stmt) == 0) {
-                        LOG_INFO("成功利用 STMT 预编译机制将聊天记录安全持久化。");
+                        LOG_INFO("STMT prepared statement persisted chat log.");
                     } else {
-                        LOG_ERROR("STMT 执行失败！错误: " + std::string(mysql_stmt_error(stmt)));
+                        LOG_ERROR("STMT execute failed: " + std::string(mysql_stmt_error(stmt)));
                     }
                     mysql_stmt_close(stmt);
                 }
@@ -160,17 +164,24 @@ void process_business(std::shared_ptr<Connection> conn) {
                 reply_body;
 
             //std::cout << "【工作线程】成功投递聊天文本响应。" << std::endl;
-            LOG_INFO("【工作线程】成功投递聊天文本响应。");
-            send(conn->fd, http_response.c_str(), http_response.length(), 0);
+            LOG_INFO("Chat text response sent.");
+
+            {
+                std::lock_guard<std::mutex> ssl_lock(conn->ssl_mutex);
+                SSL_write(conn->ssl,http_response.c_str(),http_response.length());
+            }
         }else {
-            LOG_INFO("【工作线程】收到静态网页请求，执行 sendfile 零拷贝下发。");
+            LOG_INFO("Static page request, sendfile zero-copy.");
 
             // 💡 提示：需要在服务器同级目录下提前新建一个真实的文本文件 index.html
             std::string filepath="index.html";
             int file_fd=open(filepath.c_str(),O_RDONLY);
             if (file_fd==-1) {
                 std::string err_404 = "HTTP/1.1 404 NOT FOUND\r\nContent-Length: 0\r\n\r\n";
-                send(conn->fd, err_404.c_str(), err_404.length(), 0);
+                {
+                    std::lock_guard<std::mutex> ssl_lock(conn->ssl_mutex);
+                    SSL_write(conn->ssl, err_404.c_str(), err_404.length());
+                }
                 return;
             }
 
@@ -182,9 +193,21 @@ void process_business(std::shared_ptr<Connection> conn) {
                              "Content-Type: text/html; charset=utf-8\r\n"
                              "Content-Length: " + std::to_string(stat_buf.st_size) + "\r\n"
                              "Connection: keep-alive\r\n\r\n";
-            send(conn->fd,header.c_str(),header.length(),0);
-            // ② 核心：sendfile 零拷贝系统调用，数据不经过用户态，内核直接完成倒手分发
-            sendfile(conn->fd,file_fd,nullptr,stat_buf.st_size);
+
+            {
+                std::lock_guard<std::mutex> ssl_lock(conn->ssl_mutex);
+                SSL_write(conn->ssl,header.c_str(),header.length());
+            }
+            // ② 核心权衡：在用户态通过 4KB 缓冲区边读盘边利用 SSL_write 加密发射
+            char file_buf[4096];
+            while (true) {
+                ssize_t r_bytes =read(file_fd,file_buf,sizeof(file_buf));
+                if (r_bytes<=0) break;
+                {
+                    std::lock_guard<std::mutex> ssl_lock(conn->ssl_mutex);
+                    SSL_write(conn->ssl,file_buf,r_bytes);
+                }
+            }
             close(file_fd);
         }
     }
@@ -194,12 +217,27 @@ int main() {
 
     // 初始化双缓冲日志引擎，所有的日志将被打入当前目录下的 server.log 文件中
     Logger::getInstance().init("server.log");
-    LOG_INFO("========== Tiny-Reactor 异步日志系统成功启动 ==========");
+    LOG_INFO("========== Tiny-Reactor Async Logger Started ==========");
 
-    // 🔥【v11新增】：启动并创建 8 个 MySQL 物理连接的动态复用池
-    // 请根据 Linux 本地的实际数据库配置修改：IP, 用户名, 密码, 数据库名, 端口, 连接数
+    // ➕ 核心注入①：空降 OpenSSL 引擎整体初始化与安全证书挂载大闸
+    SSL_library_init();
+    OpenSSL_add_all_algorithms();
+    SSL_load_error_strings();
+    g_ssl_ctx=SSL_CTX_new(TLS_server_method());
+    if (!g_ssl_ctx) {
+        LOG_ERROR("SSL_CTX_new failed!");
+        ERR_print_errors_fp(stderr);
+        return -1;
+    }
+
+    // 强制加载证书与私钥
+    if (SSL_CTX_use_certificate_file(g_ssl_ctx, "server.crt", SSL_FILETYPE_PEM)<=0||SSL_CTX_use_PrivateKey_file(g_ssl_ctx, "server.key", SSL_FILETYPE_PEM)<=0) {
+        LOG_ERROR("SSL cert or key load failed, server aborting!");
+        return -1;
+    }
+
     if (!MysqlConnPool::getInstance().init("127.0.0.1", "root", "root", "chat_db", 3306, 8)) {
-        LOG_ERROR("数据库连接池启动失败，服务器拉闸！");
+        LOG_ERROR("MySQL connection pool init failed, server aborting!");
         return -1;
     }
 
@@ -275,7 +313,7 @@ int main() {
                     std::cerr << "接受新连接失败！" << std::endl;
                     continue;
                 }
-                LOG_INFO("成功接受客户端连接，分配 fd: "+std::to_string(client_fd));
+                LOG_INFO("Accepted client fd: "+std::to_string(client_fd));
                 //std::cout <<  "成功接受客户端连接，分配 fd: "<< client_fd << std::endl;
 
                 // 接受连接后，必须立刻将该客户端 fd 设为非阻塞
@@ -283,10 +321,26 @@ int main() {
 
                 auto conn = std::make_shared<Connection>(client_fd);
 
+                // v14 核心：为每一个新降生的连接描述符分发 SSL 盾牌，并初始化为 Accept 接收状态
+                conn->ssl=SSL_new(g_ssl_ctx);
+                if (!conn->ssl) {
+                    LOG_ERROR("SSL_new failed! fd: " + std::to_string(client_fd));
+                    ERR_print_errors_fp(stderr);
+                    close(client_fd);
+                    continue;
+                }
+                SSL_set_fd(conn->ssl,client_fd);
+                SSL_set_accept_state(conn->ssl);
+
                 // 👑 核心派发：扔给选中的子 Reactor 托管，并自增 rr_index 游标
                 sub_reactors[rr_index]->dispatch_connection(conn);
-                LOG_INFO("【主线程】已将 fd " + std::to_string(client_fd) + " 委派至子 Reactor [" + std::to_string(rr_index) + "]");
+                LOG_INFO("Dispatched fd "+std::to_string(client_fd)+" to SubReactor ["+std::to_string(rr_index)+"]");
                 rr_index=(rr_index+1)%SUB_REACTOR_NUM;
+
+                // 🔥 关键修复：委派后，必须把 client_fd 从主 Reactor 的 epoll 中移除！
+                // 主 Reactor 不需要关心 client fd 的任何事件，交给子 Reactor 全权管理
+                // 如果不移除，主 epoll（LT 模式）也会收到 client fd 的 EPOLLIN，造成混乱
+                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, client_fd, nullptr);
             }
         }
     }

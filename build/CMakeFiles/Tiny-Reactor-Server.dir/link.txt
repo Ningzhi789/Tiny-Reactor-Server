@@ -1,0 +1,1 @@
+/usr/bin/c++     CMakeFiles/Tiny-Reactor-Server.dir/server.cpp.o  -o Tiny-Reactor-Server  -lmysqlclient -lpthread /usr/lib/x86_64-linux-gnu/libssl.so /usr/lib/x86_64-linux-gnu/libcrypto.so 

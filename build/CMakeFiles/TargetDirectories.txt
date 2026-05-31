@@ -1,0 +1,4 @@
+/home/qt/cpp_projects/Tiny-Reactor-Server/build/CMakeFiles/rebuild_cache.dir
+/home/qt/cpp_projects/Tiny-Reactor-Server/build/CMakeFiles/edit_cache.dir
+/home/qt/cpp_projects/Tiny-Reactor-Server/build/CMakeFiles/client.dir
+/home/qt/cpp_projects/Tiny-Reactor-Server/build/CMakeFiles/Tiny-Reactor-Server.dir
