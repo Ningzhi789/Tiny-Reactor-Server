@@ -22,6 +22,7 @@
 #include <sys/stat.h>       // 用于读取网页文件属性
 #include <openssl/ssl.h>    // 引入 SSL 核心
 #include <openssl/err.h>    // 增加这行
+#include <atomic>           // 引入原子级无锁安全计数器
 
 const int MAX_PACKET_SIZE=65535;
 const int MAX_EVENTS=1024;
@@ -29,6 +30,11 @@ const int BUFFER_SIZE=1024;
 
 ThreadPool* g_pool =nullptr;
 SSL_CTX* g_ssl_ctx=nullptr;
+
+// 增加以下三发全局原子雷达，无锁高能统计系统状态
+std::atomic<uint64_t> g_metrics_total_requests{0};  // 总请求吞吐数
+std::atomic<uint64_t> g_metrics_chat_count{0};      // 聊天业务命中数
+std::atomic<uint64_t> g_metrics_static_count{0};    // 静态网页请求数
 
 void set_nonblocking(int fd) {
     //获取老标志
@@ -106,16 +112,46 @@ void process_business(std::shared_ptr<Connection> conn) {
     for (const auto& url_path : ready_messages) {
         // std::this_thread::sleep_for(std::chrono::seconds(1));
         LOG_INFO("Worker decoded msg: " + url_path);
-        //std::cout << "【工作线程】安全解码成功！内容: " << url_path << std::endl;
+
+        // 只要从网络包里成功剥离出一条有效路由，总吞吐指标立刻无锁自增 1
+        ++g_metrics_total_requests;
 
         std::string chat_prefix="/chat?msg=";
         std::string http_response="";
 
+        // 👑 1. 首位拦截：如果监控中心前来拉取时序性能指标
+        if (url_path=="/metrics") {
+            LOG_INFO("Prometheus监控中心发起拉去请求，正在清算时序指标");
+
+            // 组装完全对齐 Prometheus 工业规范的明文时序度量单据
+            std::string metrics_body =
+                "# HELP tiny_reactor_requests_total Total processing throughput count\n"
+                "# TYPE tiny_reactor_requests_total counter\n"
+                "tiny_reactor_requests_total " + std::to_string(g_metrics_total_requests.load()) + "\n\n"
+
+                "# HELP tiny_reactor_chat_business_total Total processed chat logs\n"
+                "# TYPE tiny_reactor_chat_business_total counter\n"
+                "tiny_reactor_chat_business_total " + std::to_string(g_metrics_chat_count.load()) + "\n\n"
+
+                "# HELP tiny_reactor_static_pages_total Total zero-copy or static web requests\n"
+                "# TYPE tiny_reactor_static_pages_total counter\n"
+                "tiny_reactor_static_pages_total " + std::to_string(g_metrics_static_count.load()) + "\n";
+
+            // 打包成标准的 Prometheus 监控回执响应头
+            http_response =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
+                "Content-Length: " + std::to_string(metrics_body.length()) + "\r\n"
+                "Connection: keep-alive\r\n\r\n" +
+                metrics_body;
+
+            SSL_write(conn->ssl,http_response.c_str(),http_response.length());
+        }
         // 🔀 路由分支 A：如果 URL 匹配到了我们的聊天特区暗号
-        if (url_path.find(chat_prefix) == 0) {
+        else if (url_path.find(chat_prefix) == 0) {
             // 1. 提取出 `/chat?msg=` 后面的纯文本密文
             std::string raw_msg=url_path.substr(chat_prefix.length());
-
+            ++g_metrics_chat_count;
             // 2. 【新增防御】：URL 反向解码，将网络传输中的 %20 还原回空格 ' '
             size_t pos;
             while ((pos=raw_msg.find("%20"))!=std::string::npos)
@@ -172,7 +208,7 @@ void process_business(std::shared_ptr<Connection> conn) {
             }
         }else {
             LOG_INFO("Static page request, sendfile zero-copy.");
-
+            ++g_metrics_static_count;
             // 💡 提示：需要在服务器同级目录下提前新建一个真实的文本文件 index.html
             std::string filepath="index.html";
             int file_fd=open(filepath.c_str(),O_RDONLY);
